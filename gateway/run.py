@@ -231,6 +231,291 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     return None
 
 
+def _prune_unfinished_tool_tail(
+    agent_history: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Return history with an interrupted assistant/tool suffix removed.
+
+    Explicit latest-user overrides (plain stop/cancel, fresh GCB build, stale
+    context corrections) should not hand the model a still-actionable tool tail
+    from the previous turn.  Only prune the incomplete suffix shape the API
+    considers coupled: trailing tool/function messages and the assistant message
+    that requested them.  Earlier completed context is preserved.
+    """
+    if not agent_history:
+        return []
+
+    pruned = list(agent_history)
+    while pruned:
+        tail = pruned[-1]
+        if not isinstance(tail, dict):
+            break
+        if tail.get("role") not in {"tool", "function"}:
+            break
+        pruned.pop()
+
+    if pruned:
+        tail = pruned[-1]
+        if isinstance(tail, dict) and tail.get("role") == "assistant":
+            has_tool_request = bool(tail.get("tool_calls") or tail.get("function_call"))
+            has_text = bool(str(tail.get("content") or "").strip())
+            if has_tool_request or not has_text:
+                pruned.pop()
+
+    return pruned
+
+
+def _is_resume_note_override_message(message: Any) -> bool:
+    """Return True when the latest human message should override stale resume notes.
+
+    Resume/tool-tail notes are helpful for normal follow-ups to interrupted
+    work, but harmful when the latest message is an explicit stop, stale-context
+    correction, or a new live command.  This helper stays deliberately narrow so
+    ordinary follow-ups such as "what happened?" still resume fresh work.
+    """
+    if not isinstance(message, str):
+        return False
+    raw = message.strip()
+    if not raw:
+        return False
+
+    text = re.sub(r"\s+", " ", raw.lower()).strip()
+    surface = re.sub(r"[^a-z0-9\s/:-]", "", text).strip()
+    surface = re.sub(r"\s+", " ", surface)
+    if not surface:
+        return False
+
+    # Explicit new GCB/live-build commands should win over stale interrupted
+    # context, otherwise a prior tool-tail can hijack Alan's newest story.
+    if re.match(r"^(?:gcb\s+full|full\s+build)\b", surface):
+        return True
+    if re.match(r"^(?:new\s+(?:request|story|task)|start\s+new\s+(?:request|story|task))\b", surface):
+        return True
+    if re.match(r"^(?:source|source\s+text|press\s+release|fresh\s+source)\s*[:\-]", text):
+        return True
+    if len(surface) <= 140 and re.search(r"\b(?:use\s+)?(?:the\s+)?(?:last|latest)\s+\d+\s+images?\b", surface):
+        return True
+
+    # Short Telegram stop/cancel forms. Keep the bare-stop path narrow; longer
+    # messages containing the word "stop" may be ordinary prose.
+    if len(surface) <= 80:
+        if re.fullmatch(
+            r"(?:bubble?s?\s+)?(?:please\s+)?(?:stop|cancel)(?:\s+(?:now|please|it|this|all|the\s+loop|loop))?",
+            surface,
+        ):
+            return True
+        if "stop" in surface.split() and "loop" in surface.split():
+            return True
+
+    # Continuation requests should keep resume context even when they mention
+    # something being wrong; the user is steering the interrupted work, not
+    # replacing it with a fresh task.
+    if re.search(r"\b(?:continue|resume|carry\s+on|keep\s+going)\b", surface):
+        return False
+
+    stale_context_patterns = (
+        r"\bwhat\s+are\s+you\s+doing\b",
+        # Keep the ungrammatical short form that appeared in live corrections
+        # ("who mention Bugatti?") but do not catch ordinary follow-ups such
+        # as "who mentioned the delay?".
+        r"\bwho\s+mention\b",
+        r"\bthat\s+is\s+several\s+requests\s+ago\b",
+        r"\bseveral\s+requests\s+ago\b",
+        r"\bwrong\s+(?:story|article|task|context)\b",
+        r"\bnot\s+(?:that|this)\s+(?:story|article|task)\b",
+        r"\bold\s+(?:story|article|task|context)\b",
+        r"\bdifferent\s+(?:story|article|task)\b",
+    )
+    return any(re.search(pattern, surface) for pattern in stale_context_patterns)
+
+
+def _clean_session_boundary_reason(message: Any) -> Optional[str]:
+    """Classify latest-user messages that must start from a clean context.
+
+    Context compression preserves/summarizes stale state. For live editorial
+    work, a fresh job, a stale-context correction, a manual-draft edit, or a
+    failed/timed-out draft/update needs a clean session before any transcript is
+    rehydrated. The classifier is intentionally narrow so normal follow-ups such
+    as "continue" and "what happened?" can still resume interrupted work.
+    """
+    if not isinstance(message, str):
+        return None
+    raw = message.strip()
+    if not raw:
+        return None
+
+    text = re.sub(r"\s+", " ", raw.lower()).strip()
+    surface = re.sub(r"[^a-z0-9\s/:-]", "", text).strip()
+    surface = re.sub(r"\s+", " ", surface)
+    if not surface:
+        return None
+
+    if re.search(r"\b(?:continue|resume|carry\s+on|keep\s+going)\b", surface):
+        return None
+
+    if len(surface) <= 80:
+        if re.fullmatch(
+            r"(?:bubble?s?\s+)?(?:please\s+)?(?:stop|cancel)(?:\s+(?:now|please|it|this|all|the\s+loop|loop))?",
+            surface,
+        ):
+            return "stop"
+        if "stop" in surface.split() and "loop" in surface.split():
+            return "stop"
+
+    if re.match(r"^gcb\s+full\b", surface):
+        return "gcb_full"
+    if re.match(r"^full\s+build\b", surface):
+        return "full_build"
+    if re.match(r"^(?:new\s+(?:request|story|task)|start\s+new\s+(?:request|story|task))\b", surface):
+        return "new_work"
+    if re.match(r"^(?:source|source\s+text|press\s+release|fresh\s+source)\s*[:\-]", text):
+        return "new_work"
+    if len(surface) <= 140 and re.search(r"\b(?:use\s+)?(?:the\s+)?(?:last|latest)\s+\d+\s+images?\b", surface):
+        return "new_work"
+
+    if re.search(r"\b(?:i|alan|user|we)\s+(?:have\s+)?(?:manually\s+)?edited\s+(?:the\s+)?draft\b", surface):
+        return "manual_edit"
+    if re.search(r"\bmanual\s+(?:edit|edits|change|changes)\b", surface) and re.search(r"\bdraft\b", surface):
+        return "manual_edit"
+
+    failure_surface = re.search(r"\b(?:draft|update|wordpress|wp)\b", surface)
+    failure_marker = re.search(r"\b(?:failed|failure|timed\s+out|timeout|interrupted|stalled|hung)\b", surface)
+    if failure_surface and failure_marker:
+        return "failed_live_edit"
+
+    stale_context_patterns = (
+        r"\bwhat\s+are\s+you\s+doing\b",
+        r"\bwho\s+mention\b",
+        r"\bthat\s+is\s+several\s+requests\s+ago\b",
+        r"\bseveral\s+requests\s+ago\b",
+        r"\bwrong\s+(?:story|article|task|context)\b",
+        r"\bnot\s+(?:that|this)\s+(?:story|article|task)\b",
+        r"\bold\s+(?:story|article|task|context)\b",
+        r"\bdifferent\s+(?:story|article|task)\b",
+    )
+    if any(re.search(pattern, surface) for pattern in stale_context_patterns):
+        return "stale_context_correction"
+    return None
+
+
+def _format_gateway_long_running_notice(
+    elapsed_mins: int,
+    activity: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Format a user-facing long-running notice without internal telemetry."""
+    return "Still working. I’ll send the result when it’s ready."
+
+
+def _format_gateway_inactivity_warning(elapsed_mins: int, remaining_mins: int) -> str:
+    """Format a user-facing inactivity warning without tool/runtime internals."""
+    return (
+        "Still waiting on the running task. If it does not respond soon, "
+        "I’ll stop it so you can try again."
+    )
+
+
+def _format_gateway_inactivity_timeout_response(
+    timeout_mins: int,
+    activity: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Format a user-facing timeout response; detailed diagnostics stay in logs."""
+    return (
+        f"The task stopped after {timeout_mins} min without activity. "
+        "No verified result was produced. Try again, or use /reset to start fresh."
+    )
+
+
+def _event_text(event: Any) -> str:
+    return str(getattr(event, "text", "") or "")
+
+
+def _event_user_name(event: Any) -> str:
+    source = getattr(event, "source", None)
+    return str(getattr(source, "user_name", "") or getattr(source, "user_id", "") or "")
+
+
+def _classify_busy_ack_audience(event: Any = None, *, session_key: str = "") -> str:
+    """Return 'technical' for Scott/debug chats, 'gcb' for Alan/GCB live work.
+
+    The classifier is intentionally conservative: Scott keeps detailed telemetry;
+    any GCB/full-build/latest-image/source-pack wording gets Alan-safe wording.
+    """
+    text = _event_text(event).lower()
+    user = _event_user_name(event).lower()
+    session = str(session_key or "").lower()
+    if "scott" in user or "scott" in session:
+        return "technical"
+    gcb_markers = (
+        "gcb",
+        "gay car boys",
+        "full build",
+        "source:",
+        "source text:",
+        "press release:",
+    )
+    if any(marker in text for marker in gcb_markers):
+        return "gcb"
+    if re.search(r"\b(?:last|latest)\s+\d+\s+images?\b", text):
+        return "gcb"
+    if "alan" in user or "alan" in session:
+        return "gcb"
+    return "technical"
+
+
+def _format_busy_ack(
+    event: Any = None,
+    *,
+    mode: str = "interrupt",
+    summary: Optional[Dict[str, Any]] = None,
+    audience: str = "technical",
+) -> str:
+    """Format active-session busy acknowledgement for the right audience."""
+    mode = (mode or "interrupt").strip().lower()
+    summary = summary or {}
+    audience = (audience or "technical").strip().lower()
+
+    if audience in {"alan", "gcb", "user_safe"}:
+        if mode == "queue":
+            return "Working on the current draft. Your latest message is queued."
+        if mode == "steer":
+            return "I’ll apply that after the current tool step finishes."
+        return "Stopping the current run."
+
+    status_parts: List[str] = []
+    elapsed_min = summary.get("elapsed_min")
+    if elapsed_min:
+        try:
+            elapsed_int = int(elapsed_min)
+        except (TypeError, ValueError):
+            elapsed_int = 0
+        if elapsed_int > 0:
+            status_parts.append(f"{elapsed_int} min elapsed")
+    max_iter = summary.get("max_iterations") or 0
+    iteration = summary.get("api_call_count") or 0
+    if max_iter:
+        status_parts.append(f"iteration {iteration}/{max_iter}")
+    current_tool = summary.get("current_tool")
+    if current_tool:
+        status_parts.append(f"running: {current_tool}")
+    status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
+
+    if mode == "steer":
+        return (
+            f"⏩ Steered into current run{status_detail}. "
+            "Your message arrives after the next tool call."
+        )
+    if mode == "queue":
+        return (
+            f"⏳ Queued for the next turn{status_detail}. "
+            "I'll respond once the current task finishes."
+        )
+    return (
+        f"⚡ Interrupting current task{status_detail}. "
+        "I'll respond to your message shortly."
+    )
+
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -2058,47 +2343,32 @@ class GatewayRunner:
 
         self._busy_ack_ts[session_key] = now
 
-        # Build a status-rich acknowledgment
-        status_parts = []
+        # Build an audience-aware acknowledgment. Scott/debug chats keep runtime
+        # details; Alan/GCB live work gets short external status only.
+        summary: Dict[str, Any] = {}
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             try:
-                summary = running_agent.get_activity_summary()
-                iteration = summary.get("api_call_count", 0)
-                max_iter = summary.get("max_iterations", 0)
-                current_tool = summary.get("current_tool")
+                summary = dict(running_agent.get_activity_summary() or {})
                 start_ts = self._running_agents_ts.get(session_key, 0)
                 if start_ts:
                     elapsed_min = int((now - start_ts) / 60)
                     if elapsed_min > 0:
-                        status_parts.append(f"{elapsed_min} min elapsed")
-                if max_iter:
-                    status_parts.append(f"iteration {iteration}/{max_iter}")
-                if current_tool:
-                    status_parts.append(f"running: {current_tool}")
+                        summary["elapsed_min"] = elapsed_min
             except Exception:
-                pass
+                summary = {}
 
-        status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
-        if is_steer_mode:
-            message = (
-                f"⏩ Steered into current run{status_detail}. "
-                f"Your message arrives after the next tool call."
-            )
-        elif is_queue_mode:
-            message = (
-                f"⏳ Queued for the next turn{status_detail}. "
-                f"I'll respond once the current task finishes."
-            )
-        else:
-            message = (
-                f"⚡ Interrupting current task{status_detail}. "
-                f"I'll respond to your message shortly."
-            )
+        audience = _classify_busy_ack_audience(event, session_key=session_key)
+        message = _format_busy_ack(
+            event,
+            mode=effective_mode,
+            summary=summary,
+            audience=audience,
+        )
 
         # First-touch onboarding: the very first time a user sends a message
         # while the agent is busy, append a one-time hint explaining the
-        # queue/interrupt knob.  Flag is persisted to config.yaml so it never
-        # fires again on this install.
+        # queue/interrupt knob.  Suppress this for Alan/GCB live work because
+        # that audience should never see internal control mechanics.
         try:
             from agent.onboarding import (
                 BUSY_INPUT_FLAG,
@@ -2107,7 +2377,7 @@ class GatewayRunner:
                 mark_seen,
             )
             _user_cfg = _load_gateway_config()
-            if not is_seen(_user_cfg, BUSY_INPUT_FLAG):
+            if audience == "technical" and not is_seen(_user_cfg, BUSY_INPUT_FLAG):
                 if is_steer_mode:
                     _hint_mode = "steer"
                 elif is_queue_mode:
@@ -5514,6 +5784,63 @@ class GatewayRunner:
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+
+        clean_boundary_reason = _clean_session_boundary_reason(getattr(event, "text", ""))
+        if clean_boundary_reason:
+            old_session_id = getattr(session_entry, "session_id", None)
+            self._evict_cached_agent(session_key)
+            if hasattr(self, "_queued_events"):
+                self._queued_events.pop(session_key, None)
+            if hasattr(self, "_pending_messages"):
+                self._pending_messages.pop(session_key, None)
+            if hasattr(self, "_pending_native_image_paths_by_session"):
+                self._pending_native_image_paths_by_session.pop(session_key, None)
+            try:
+                from tools.env_passthrough import clear_env_passthrough
+                clear_env_passthrough()
+            except Exception:
+                pass
+            try:
+                from tools.credential_files import clear_credential_files
+                clear_credential_files()
+            except Exception:
+                pass
+
+            reset_entry = self.session_store.reset_session(session_key)
+            if reset_entry is None:
+                reset_entry = self.session_store.get_or_create_session(source, force_new=True)
+            session_entry = reset_entry
+            self._session_model_overrides.pop(session_key, None)
+            self._set_session_reasoning_override(session_key, None)
+            if hasattr(self, "_pending_model_notes"):
+                self._pending_model_notes.pop(session_key, None)
+            self._clear_session_boundary_security_state(session_key)
+            try:
+                await self.hooks.emit("session:end", {
+                    "platform": source.platform.value if source.platform else "",
+                    "user_id": source.user_id,
+                    "session_key": session_key,
+                    "session_id": old_session_id,
+                    "reason": f"clean_boundary:{clean_boundary_reason}",
+                })
+                await self.hooks.emit("session:reset", {
+                    "platform": source.platform.value if source.platform else "",
+                    "user_id": source.user_id,
+                    "session_key": session_key,
+                    "session_id": getattr(session_entry, "session_id", None),
+                    "reason": f"clean_boundary:{clean_boundary_reason}",
+                })
+            except Exception as e:
+                logger.debug("Clean-boundary session reset hook failed (non-fatal): %s", e)
+            logger.info(
+                "Clean session boundary for %s (%s): %s -> %s",
+                session_key,
+                clean_boundary_reason,
+                old_session_id,
+                getattr(session_entry, "session_id", None),
+            )
+            if clean_boundary_reason == "stop":
+                return EphemeralReply("⚡ Stopped. Starting fresh next message.")
         if getattr(session_entry, "was_auto_reset", False):
             # Treat auto-reset as a full conversation boundary — drop every
             # session-scoped transient state so the fresh session does not
@@ -12523,6 +12850,11 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
 
+            # Preserve the raw human surface before gateway-injected notes are
+            # prepended.  Resume/tool-tail suppression must inspect the user's
+            # latest instruction, not a model-switch wrapper.
+            _resume_note_override_surface = message
+
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
             _msn = _pending_notes.pop(session_key, None) if session_key else None
@@ -12563,15 +12895,32 @@ class GatewayRunner:
                     _resume_entry = self.session_store._entries.get(session_key)
                 except Exception:
                     _resume_entry = None
+            _resume_note_override = _is_resume_note_override_message(
+                _resume_note_override_surface
+            )
+            if _resume_note_override:
+                agent_history = _prune_unfinished_tool_tail(agent_history)
             _is_resume_pending = bool(
                 _resume_entry is not None
                 and getattr(_resume_entry, "resume_pending", False)
                 and _interruption_is_fresh
             )
+            if _is_resume_pending and _resume_note_override:
+                try:
+                    self.session_store.clear_resume_pending(session_key)
+                except Exception as _e:
+                    logger.debug(
+                        "clear_resume_pending after latest-message override failed for %s: %s",
+                        session_key,
+                        _e,
+                    )
+                _is_resume_pending = False
+
             _has_fresh_tool_tail = bool(
                 agent_history
                 and agent_history[-1].get("role") == "tool"
                 and _interruption_is_fresh
+                and not _resume_note_override
             )
 
             if _is_resume_pending:
@@ -12909,24 +13258,19 @@ class GatewayRunner:
             while True:
                 await asyncio.sleep(_NOTIFY_INTERVAL)
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
-                # Include agent activity context if available.
+                # Keep user-facing heartbeat concise.  Detailed runtime
+                # telemetry stays in logs and /status for technical users.
                 _agent_ref = agent_holder[0]
-                _status_detail = ""
+                _activity = None
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
-                        _a = _agent_ref.get_activity_summary()
-                        _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
-                        if _a.get("current_tool"):
-                            _parts.append(f"running: {_a['current_tool']}")
-                        else:
-                            _parts.append(_a.get("last_activity_desc", ""))
-                        _status_detail = " — " + ", ".join(_parts)
+                        _activity = _agent_ref.get_activity_summary()
                     except Exception:
-                        pass
+                        _activity = None
                 try:
                     await _notify_adapter.send(
                         source.chat_id,
-                        f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
+                        _format_gateway_long_running_notice(_elapsed_mins, _activity),
                         metadata=_status_thread_metadata,
                     )
                 except Exception as _ne:
@@ -13017,10 +13361,10 @@ class GatewayRunner:
                             try:
                                 await _warn_adapter.send(
                                     source.chat_id,
-                                    f"⚠️ No activity for {_elapsed_warn} min. "
-                                    f"If the agent does not respond soon, it will "
-                                    f"be timed out in {_remaining_mins} min. "
-                                    f"You can continue waiting or use /reset.",
+                                    _format_gateway_inactivity_warning(
+                                        _elapsed_warn,
+                                        _remaining_mins,
+                                    ),
                                     metadata=_status_thread_metadata,
                                 )
                             except Exception as _warn_err:
@@ -13077,31 +13421,13 @@ class GatewayRunner:
 
                 _timeout_mins = int(_agent_timeout // 60) or 1
 
-                # Construct a user-facing message with diagnostic context.
-                _diag_lines = [
-                    f"⏱️ Agent inactive for {_timeout_mins} min — no tool calls "
-                    f"or API responses."
-                ]
-                if _cur_tool:
-                    _diag_lines.append(
-                        f"The agent appears stuck on tool `{_cur_tool}` "
-                        f"({_secs_ago:.0f}s since last activity, "
-                        f"iteration {_iter_n}/{_iter_max})."
-                    )
-                else:
-                    _diag_lines.append(
-                        f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
-                        f"iteration {_iter_n}/{_iter_max}). "
-                        "The agent may have been waiting on an API response."
-                    )
-                _diag_lines.append(
-                    "To increase the limit, set agent.gateway_timeout in config.yaml "
-                    "(value in seconds, 0 = no limit) and restart the gateway.\n"
-                    "Try again, or use /reset to start fresh."
-                )
-
+                # Construct a concise user-facing message.  Detailed diagnostic
+                # context is logged above for /status/log review instead.
                 response = {
-                    "final_response": "\n".join(_diag_lines),
+                    "final_response": _format_gateway_inactivity_timeout_response(
+                        _timeout_mins,
+                        _activity,
+                    ),
                     "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                     "api_calls": _iter_n,
                     "tools": tools_holder[0] or [],

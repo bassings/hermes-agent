@@ -26,12 +26,17 @@ PRs #9850, #9934, #7536):
 """
 
 import asyncio
+import sys
+import threading
 import time
+import types
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import (
     _auto_continue_freshness_window,
@@ -112,16 +117,21 @@ def _simulate_note_injection(
         window_secs=window,
     )
 
+    from gateway.run import _is_resume_note_override_message
+
     message = user_message
+    suppress_resume_note = _is_resume_note_override_message(user_message)
     is_resume_pending = bool(
         resume_entry is not None
         and getattr(resume_entry, "resume_pending", False)
         and interruption_is_fresh
+        and not suppress_resume_note
     )
     has_fresh_tool_tail = bool(
         agent_history
         and agent_history[-1].get("role") == "tool"
         and interruption_is_fresh
+        and not suppress_resume_note
     )
 
     if is_resume_pending:
@@ -151,6 +161,81 @@ def _simulate_note_injection(
             + message
         )
     return message
+
+
+class _CapturingRunAgent:
+    """Fake AIAgent for _run_agent tests that records actual agent inputs."""
+
+    last_run = None
+
+    def __init__(self, *args, **kwargs):
+        self.model = args[0] if args else kwargs.get("model", "test-model")
+        self.tools = []
+        self.session_id = kwargs.get("session_id")
+
+    def run_conversation(self, user_message, conversation_history=None, task_id=None):
+        type(self).last_run = {
+            "user_message": user_message,
+            "conversation_history": list(conversation_history or []),
+            "task_id": task_id,
+        }
+        return {"final_response": "Stopped.", "messages": [], "api_calls": 1}
+
+
+class _ResumeClearingStore:
+    def __init__(self, entry: SessionEntry):
+        self._entries = {entry.session_key: entry}
+        self.cleared: list[str] = []
+
+    def clear_resume_pending(self, session_key: str) -> bool:
+        self.cleared.append(session_key)
+        entry = self._entries.get(session_key)
+        if not entry:
+            return False
+        entry.resume_pending = False
+        entry.resume_reason = None
+        entry.last_resume_marked_at = None
+        return True
+
+    def _save(self):
+        return None
+
+
+def _make_run_agent_runner(entry: SessionEntry):
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.adapters = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._busy_ack_ts = {}
+    runner._draining = False
+    runner._ephemeral_system_prompt = ""
+    runner._fallback_model = None
+    runner._pending_model_notes = {}
+    runner._pending_native_image_paths_by_session = {}
+    runner._pending_skills_reload_notes = {}
+    runner._prefill_messages = []
+    runner._provider_routing = {}
+    runner._reasoning_config = None
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._service_tier = None
+    runner._session_db = None
+    runner._session_model_overrides = {}
+    runner._session_run_generation = {}
+    runner.config = SimpleNamespace(streaming=SimpleNamespace(enabled=False, transport="off"))
+    runner.hooks = SimpleNamespace(loaded_hooks=False)
+    runner.session_store = _ResumeClearingStore(entry)
+    runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
+    runner._load_service_tier = lambda: None
+    runner._resolve_session_reasoning_config = lambda **kwargs: None
+    runner._update_runtime_status = lambda status: None
+    return runner
+
+
+def _install_capturing_agent(monkeypatch):
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CapturingRunAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +709,172 @@ class TestResumePendingSystemNote:
         ]
         result = _simulate_note_injection(history, "ping", resume_entry=None)
         assert result == "ping"
+
+    @pytest.mark.parametrize(
+        "user_message",
+        [
+            "stop",
+            "what are you doing?",
+            "who mention Bugatti?",
+            "that is several requests ago",
+            "wrong story",
+            "new request",
+            "source: fresh supplied text for a different story",
+            "use the last 9 images",
+            "gcb full use the last 9 images",
+            "full build from this text",
+        ],
+    )
+    def test_latest_explicit_override_suppresses_resume_pending_note(self, user_message):
+        entry = self._pending_entry()
+        history = [
+            {"role": "assistant", "content": "old task in progress", "timestamp": time.time()},
+        ]
+
+        result = _simulate_note_injection(history, user_message, resume_entry=entry)
+
+        assert "[System note:" not in result
+        assert result == user_message
+
+    def test_latest_explicit_override_suppresses_fresh_tool_tail_note(self):
+        history = [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "function": {"name": "x", "arguments": "{}"}},
+            ], "timestamp": time.time() - 1},
+            {"role": "tool", "tool_call_id": "c1", "content": "old task result",
+             "timestamp": time.time()},
+        ]
+
+        result = _simulate_note_injection(
+            history,
+            "who mention Bugatti?",
+            resume_entry=None,
+        )
+
+        assert "[System note:" not in result
+        assert result == "who mention Bugatti?"
+
+    def test_normal_follow_up_still_gets_resume_pending_note(self):
+        entry = self._pending_entry()
+        history = [
+            {"role": "assistant", "content": "current task in progress", "timestamp": time.time()},
+        ]
+
+        result = _simulate_note_injection(history, "what happened?", resume_entry=entry)
+
+        assert "[System note:" in result
+        assert "gateway restart" in result
+        assert "what happened?" in result
+
+    def test_plain_stop_override_prunes_unfinished_tool_tail_from_history(self):
+        agent_history = _build_agent_history([
+            {"role": "user", "content": "old task", "timestamp": time.time() - 3},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "terminal", "arguments": "{}"}},
+                ],
+                "timestamp": time.time() - 2,
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "stale tool result text",
+                "timestamp": time.time() - 1,
+            },
+        ])
+
+        pruned = gateway_run._prune_unfinished_tool_tail(agent_history)
+
+        assert pruned == [{"role": "user", "content": "old task"}]
+        assert agent_history[-1]["role"] == "tool"  # original list is not mutated
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "who mentioned the delay?",
+            "what was wrong with the story?",
+            "can you continue but fix the wrong story angle?",
+        ],
+    )
+    def test_resume_override_does_not_trigger_for_normal_followups(self, message):
+        assert gateway_run._is_resume_note_override_message(message) is False
+
+    @pytest.mark.asyncio
+    async def test_plain_stop_override_clears_resume_and_prunes_actual_agent_history(
+        self,
+        monkeypatch,
+    ):
+        _install_capturing_agent(monkeypatch)
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {"display": {"tool_progress": "off", "interim_assistant_messages": False}},
+        )
+        monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "test-model")
+        monkeypatch.setattr(
+            gateway_run,
+            "_resolve_runtime_agent_kwargs",
+            lambda: {"provider": "test", "api_mode": "chat_completions", "api_key": "***"},
+        )
+        import hermes_cli.tools_config as tools_config
+
+        monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: set())
+        monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "0")
+        monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0")
+
+        session_key = "agent:main:telegram:dm:123"
+        now = datetime.now()
+        entry = SessionEntry(
+            session_key=session_key,
+            session_id="session-1",
+            created_at=now,
+            updated_at=now,
+            resume_pending=True,
+            resume_reason="restart_timeout",
+            last_resume_marked_at=now,
+        )
+        runner = _make_run_agent_runner(entry)
+        history = [
+            {"role": "user", "content": "old task", "timestamp": time.time() - 3},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "terminal", "arguments": "{}"}},
+                ],
+                "timestamp": time.time() - 2,
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "stale tool result text",
+                "timestamp": time.time() - 1,
+            },
+        ]
+        _CapturingRunAgent.last_run = None
+
+        result = await runner._run_agent(
+            message="stop now",
+            context_prompt="",
+            history=history,
+            source=_make_source(chat_id="123"),
+            session_id="session-1",
+            session_key=session_key,
+        )
+
+        assert result["final_response"] == "Stopped."
+        assert entry.resume_pending is False
+        assert runner.session_store.cleared == [session_key]
+        captured = _CapturingRunAgent.last_run
+        assert captured is not None
+        assert captured["user_message"] == "stop now"
+        captured_text = str(captured["conversation_history"])
+        assert "System note:" not in captured["user_message"]
+        assert "stale tool result text" not in captured_text
+        assert not any(msg.get("role") == "tool" for msg in captured["conversation_history"])
+        assert not any("tool_calls" in msg for msg in captured["conversation_history"])
 
 
 # ---------------------------------------------------------------------------
