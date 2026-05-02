@@ -97,7 +97,7 @@ def test_completion_only_from_verified_and_delivery_is_terminal(tmp_path):
         draft_edit_url="https://example/edit/123",
         selected_shell_post_id=99,
     )
-    state = orch.transition(state, "VERIFIED", verification={"ok": True, "media_ids": [1, 2]})
+    state = orch.transition(state, "VERIFIED", verification={"ok": True, "media_ids": [1, 2], "style_lint": {"ok": True}})
     payload = orch.completion_payload(state)
 
     assert state["draft_id"] == 123
@@ -111,8 +111,22 @@ def test_completion_only_from_verified_and_delivery_is_terminal(tmp_path):
     assert delivered["phase"] == "DELIVERED"
     assert delivered["terminal_state"] == "DELIVERED"
 
-    unchanged = orch.transition(delivered, "VERIFIED", verification={"ok": True})
+    unchanged = orch.transition(delivered, "VERIFIED", verification={"ok": True, "style_lint": {"ok": True}})
     assert unchanged == delivered
+
+
+def test_final_verification_requires_copy_style_lint(tmp_path):
+    orch = _load_script("gcb_full_orchestrator.py")
+    state = orch.create_job("source", "gcb full", 1, root_dir=tmp_path)
+    state = orch.transition(state, "DRAFT_PACKAGE_READY", actual_image_count=1, gate_results={
+        "style": {"ok": True}, "anti_ai": {"ok": True}, "copy": {"ok": True}
+    })
+    state = orch.transition(state, "DRAFT_WRITTEN", post_id=123, draft_edit_url="https://example/edit/123")
+
+    failed = orch.transition(state, "VERIFIED", verification={"ok": True})
+
+    assert failed["phase"] == "FAILED"
+    assert "copy-style-lint-not-passed" in failed["errors"]
 
 
 def test_final_verification_runs_once(tmp_path):
@@ -122,8 +136,8 @@ def test_final_verification_runs_once(tmp_path):
         "style": {"ok": True}, "anti_ai": {"ok": True}, "copy": {"ok": True}
     })
     state = orch.transition(state, "DRAFT_WRITTEN", post_id=123, draft_edit_url="https://example/edit/123")
-    verified = orch.transition(state, "VERIFIED", verification={"ok": True})
-    failed_second = orch.transition(verified, "VERIFIED", verification={"ok": True})
+    verified = orch.transition(state, "VERIFIED", verification={"ok": True, "style_lint": {"ok": True}})
+    failed_second = orch.transition(verified, "VERIFIED", verification={"ok": True, "style_lint": {"ok": True}})
 
     assert verified["phase"] == "VERIFIED"
     assert failed_second["phase"] == "FAILED"

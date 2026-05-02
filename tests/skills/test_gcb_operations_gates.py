@@ -61,6 +61,56 @@ def test_style_lint_flags_current_alan_banned_phrases():
     assert result["ok"] is False
 
 
+def test_style_lint_flags_padding_and_banned_word_regression_from_suzuki_job():
+    mod = _load_script("gcb_style_lint.py")
+
+    result = mod.lint_text(
+        "The thing is this SUV is at 100 per cent. That is the awkward bit. "
+        "The basics are sensible enough. The bigger story is sharp pricing in the release.",
+        mode="article",
+    )
+
+    rule_ids = {issue["rule_id"] for issue in result["issues"]}
+    assert {
+        "banned-the-thing-is",
+        "banned-thing-vehicle",
+        "banned-per-cent",
+        "banned-that-is-the-awkward-bit",
+        "banned-basics-are-sensible-enough",
+        "banned-the-bigger-story",
+        "banned-sharp-pricing",
+        "banned-release",
+    } <= rule_ids
+    assert result["ok"] is False
+
+
+def test_style_lint_matches_documented_banned_word_set():
+    mod = _load_script("gcb_style_lint.py")
+
+    result = mod.lint_text(
+        "Massive clearly literal release. The story is this is where the sort of "
+        "padding starts. The logic is simple enough. That last bit is filler and here is where it gets interesting. "
+        "Some might say it is literally fine.",
+        mode="article",
+    )
+
+    rule_ids = {issue["rule_id"] for issue in result["issues"]}
+    assert {
+        "banned-massive",
+        "banned-clearly",
+        "banned-release",
+        "banned-the-story-is",
+        "banned-this-is-where",
+        "banned-the-sort-of",
+        "banned-the-logic-is-simple-enough",
+        "banned-that-last-bit-is",
+        "banned-here-is-where-it-gets-interesting",
+        "banned-some-might-say",
+        "banned-literally-filler",
+    } <= rule_ids
+    assert result["ok"] is False
+
+
 def test_style_lint_flags_mechanical_style_regressions():
     mod = _load_script("gcb_style_lint.py")
 
@@ -210,6 +260,38 @@ def test_wp_draft_guard_rejects_duplicate_core_gallery_and_missing_required_vide
     assert "core-gallery-not-spectra" in rule_ids
     assert "duplicate-spectra-gallery" in rule_ids
     assert "missing-required-video" in rule_ids
+
+
+def test_wp_draft_guard_rejects_final_draft_copy_that_fails_style_lint(tmp_path):
+    post = {
+        "ID": 777,
+        "title": {"raw": "Suzuki e VITARA Pricing"},
+        "excerpt": {"raw": "Suzuki e VITARA has pricing."},
+        "content": {
+            "raw": """
+            <!-- wp:paragraph --><p>The basics are sensible enough. It charges to 100 per cent.</p><!-- /wp:paragraph -->
+            <!-- wp:uagb/image-gallery {"ids":[1,2]} /-->
+            <!-- wp:paragraph --><p><strong>More Stories</strong></p><!-- /wp:paragraph -->
+            """
+        },
+        "status": "draft",
+    }
+    path = tmp_path / "post.json"
+    path.write_text(json.dumps(post), encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT_DIR / "gcb_wp_draft_guard.py"), "verify-post", str(path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    payload = json.loads(proc.stdout)
+    rule_ids = {issue["rule_id"] for issue in payload["issues"]}
+    assert proc.returncode == 1
+    assert payload["checks"]["style_lint_ok"] is False
+    assert "style-lint:banned-basics-are-sensible-enough" in rule_ids
+    assert "style-lint:banned-per-cent" in rule_ids
 
 
 def test_wp_draft_guard_compare_surfaces_rejects_forbidden_spelling_only_changes(tmp_path):
