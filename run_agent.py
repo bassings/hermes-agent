@@ -1666,6 +1666,7 @@ class AIAgent:
         self._memory_store = None
         self._memory_enabled = False
         self._user_profile_enabled = False
+        self._background_review_memory_writes_enabled = False
         self._memory_nudge_interval = 10
         self._turns_since_memory = 0
         self._iters_since_skill = 0
@@ -1674,6 +1675,13 @@ class AIAgent:
                 mem_config = _agent_cfg.get("memory", {})
                 self._memory_enabled = mem_config.get("memory_enabled", False)
                 self._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+                _bg_memory_raw = mem_config.get(
+                    "background_review_memory_writes_enabled",
+                    mem_config.get("allow_background_review_writes", False),
+                )
+                self._background_review_memory_writes_enabled = str(_bg_memory_raw).strip().lower() in (
+                    "1", "true", "yes", "on"
+                )
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
                 if self._memory_enabled or self._user_profile_enabled:
                     from tools.memory_tool import MemoryStore
@@ -3536,6 +3544,12 @@ class AIAgent:
         Never modifies the main conversation history or produces user-visible output.
         """
         import threading
+
+        if review_memory and not getattr(self, "_background_review_memory_writes_enabled", False):
+            logger.debug("Background memory review skipped: background writes are not enabled")
+            review_memory = False
+        if not review_memory and not review_skills:
+            return
 
         # Pick the right prompt based on which triggers fired
         if review_memory and review_skills:
@@ -10467,7 +10481,8 @@ class AIAgent:
         # Skill trigger is checked AFTER the agent loop completes, based on
         # how many tool iterations THIS turn used.
         _should_review_memory = False
-        if (self._memory_nudge_interval > 0
+        if (getattr(self, "_background_review_memory_writes_enabled", False)
+                and self._memory_nudge_interval > 0
                 and "memory" in self.valid_tool_names
                 and self._memory_store):
             self._turns_since_memory += 1

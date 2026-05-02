@@ -384,17 +384,118 @@ def _write_env_vars(env_path: Path, env_writes: dict) -> None:
 # Status
 # ---------------------------------------------------------------------------
 
+_ENTRY_DELIMITER = "\n§\n"
+
+
+def _read_raw_memory_entries(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    return [part.strip() for part in text.split(_ENTRY_DELIMITER) if part.strip()]
+
+
+def _memory_usage(entries: list[str], limit: int) -> tuple[int, int]:
+    used = len(_ENTRY_DELIMITER.join(entries)) if entries else 0
+    pct = int(round((used / limit) * 100)) if limit else 0
+    return used, pct
+
+
+def _duplicate_count(entries: list[str]) -> int:
+    seen = set()
+    duplicates = 0
+    for entry in entries:
+        key = " ".join(entry.lower().split())
+        if key in seen:
+            duplicates += 1
+        else:
+            seen.add(key)
+    return duplicates
+
+
+def _fact_count(config: dict) -> int:
+    try:
+        import sqlite3
+
+        plugin_cfg = ((config.get("plugins") or {}).get("hermes-memory-store") or {})
+        db_path = str(plugin_cfg.get("db_path") or (get_hermes_home() / "memory_store.db"))
+        db_path = db_path.replace("$HERMES_HOME", str(get_hermes_home()))
+        db_path = db_path.replace("${HERMES_HOME}", str(get_hermes_home()))
+        path = Path(db_path).expanduser()
+        if not path.exists():
+            return 0
+        with sqlite3.connect(path) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM facts").fetchone()
+            return int(row[0] if row else 0)
+    except Exception:
+        return 0
+
+
+def _status_line_for_usage(name: str, entries: list[str], limit: int) -> tuple[list[str], bool]:
+    used, pct = _memory_usage(entries, limit)
+    lines = [
+        f"  {name} entries:  {len(entries)}",
+        f"  {name} usage:    {pct}% — {used:,}/{limit:,} chars",
+    ]
+    return lines, pct >= 75
+
+
 def cmd_status(args) -> None:
     """Show current memory provider config."""
     from hermes_cli.config import load_config
 
     config = load_config()
-    mem_config = config.get("memory", {})
-    provider_name = mem_config.get("provider", "")
+    mem_config = config.get("memory", {}) if isinstance(config.get("memory", {}), dict) else {}
+    provider_name = str(mem_config.get("provider", "") or "").strip()
+    memory_enabled = bool(mem_config.get("memory_enabled", False))
+    user_profile_enabled = bool(mem_config.get("user_profile_enabled", False))
+    memory_limit = int(mem_config.get("memory_char_limit", 2200) or 2200)
+    user_limit = int(mem_config.get("user_char_limit", 1375) or 1375)
+
+    mem_dir = get_hermes_home() / "memories"
+    memory_entries = _read_raw_memory_entries(mem_dir / "MEMORY.md")
+    user_entries = _read_raw_memory_entries(mem_dir / "USER.md")
+    memory_used, memory_pct = _memory_usage(memory_entries, memory_limit)
+    user_used, user_pct = _memory_usage(user_entries, user_limit)
+    memory_dupes = _duplicate_count(memory_entries)
+    user_dupes = _duplicate_count(user_entries)
+    near_capacity = []
+    if memory_pct >= 75:
+        near_capacity.append("memory")
+    if user_pct >= 75:
+        near_capacity.append("user")
+
+    providers = _get_available_providers()
+    provider_status = "inactive"
+    active_provider = None
+    if provider_name:
+        for pname, _desc, provider in providers:
+            if pname == provider_name:
+                active_provider = provider
+                provider_status = "active" if provider.is_available() else "configured but unavailable"
+                break
+        else:
+            provider_status = "configured but not installed"
 
     print(f"\nMemory status\n" + "─" * 40)
-    print(f"  Built-in:  always active")
+    print(f"  Built-in:  {'active' if (memory_enabled or user_profile_enabled) else 'inactive'}")
     print(f"  Provider:  {provider_name or '(none — built-in only)'}")
+    print(f"  Provider status: {provider_status}")
+    print(f"  Memory entries:  {len(memory_entries)}")
+    print(f"  Memory usage:    {memory_pct}% — {memory_used:,}/{memory_limit:,} chars")
+    print(f"  User entries:    {len(user_entries)}")
+    print(f"  User usage:      {user_pct}% — {user_used:,}/{user_limit:,} chars")
+    print(f"  Fact count:      {_fact_count(config)}")
+    print(f"  Near capacity:   {', '.join(near_capacity) if near_capacity else 'no'}")
+    duplicate_notes = []
+    if memory_dupes:
+        duplicate_notes.append("memory has duplicate entries")
+    if user_dupes:
+        duplicate_notes.append("user profile has duplicate entries")
+    if memory_pct >= 90 or user_pct >= 90:
+        duplicate_notes.append("very high usage increases stale/noisy prompt risk")
+    print(f"  Duplicate/noise risk: {', '.join(duplicate_notes) if duplicate_notes else 'low'}")
 
     if provider_name:
         provider_config = mem_config.get(provider_name, {})
@@ -403,36 +504,29 @@ def cmd_status(args) -> None:
             for key, val in provider_config.items():
                 print(f"    {key}: {val}")
 
-        providers = _get_available_providers()
-        found = any(name == provider_name for name, _, _ in providers)
-        if found:
+        if active_provider is not None:
             print(f"\n  Plugin:    installed ✓")
-            for pname, _, p in providers:
-                if pname == provider_name:
-                    if p.is_available():
-                        print(f"  Status:    available ✓")
-                    else:
-                        print(f"  Status:    not available ✗")
-                        schema = p.get_config_schema() if hasattr(p, "get_config_schema") else []
-                        # Check all fields that have env_var (both secret and non-secret)
-                        required_fields = [f for f in schema if f.get("env_var")]
-                        if required_fields:
-                            print(f"  Missing:")
-                            for f in required_fields:
-                                env_var = f.get("env_var", "")
-                                url = f.get("url", "")
-                                is_set = bool(os.environ.get(env_var))
-                                mark = "✓" if is_set else "✗"
-                                line = f"    {mark} {env_var}"
-                                if url and not is_set:
-                                    line += f"  → {url}"
-                                print(line)
-                    break
+            if provider_status == "active":
+                print(f"  Status:    available ✓")
+            else:
+                print(f"  Status:    not available ✗")
+                schema = active_provider.get_config_schema() if hasattr(active_provider, "get_config_schema") else []
+                required_fields = [f for f in schema if f.get("env_var")]
+                if required_fields:
+                    print(f"  Missing:")
+                    for f in required_fields:
+                        env_var = f.get("env_var", "")
+                        url = f.get("url", "")
+                        is_set = bool(os.environ.get(env_var))
+                        mark = "✓" if is_set else "✗"
+                        line = f"    {mark} {env_var}"
+                        if url and not is_set:
+                            line += f"  → {url}"
+                        print(line)
         else:
             print(f"\n  Plugin:    NOT installed ✗")
             print(f"  Install the '{provider_name}' memory plugin to ~/.hermes/plugins/")
 
-    providers = _get_available_providers()
     if providers:
         print(f"\n  Installed plugins:")
         for pname, desc, _ in providers:

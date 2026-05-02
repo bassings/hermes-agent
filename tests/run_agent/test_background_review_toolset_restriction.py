@@ -20,6 +20,7 @@ def _make_agent_stub(agent_cls):
     agent._memory_store = None
     agent._memory_enabled = True
     agent._user_profile_enabled = False
+    agent._background_review_memory_writes_enabled = True
     agent._memory_nudge_interval = 5
     agent._skill_nudge_interval = 5
     agent.background_review_callback = None

@@ -20,6 +20,7 @@ def _bare_agent() -> AIAgent:
     agent._memory_store = object()
     agent._memory_enabled = True
     agent._user_profile_enabled = False
+    agent._background_review_memory_writes_enabled = True
     agent._MEMORY_REVIEW_PROMPT = "review memory"
     agent._SKILL_REVIEW_PROMPT = "review skills"
     agent._COMBINED_REVIEW_PROMPT = "review both"
@@ -35,6 +36,28 @@ class ImmediateThread:
 
     def start(self):
         self._target()
+
+
+def test_background_review_memory_writes_are_skipped_unless_enabled(monkeypatch):
+    events = []
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            events.append(("init", kwargs))
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    agent._background_review_memory_writes_enabled = False
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    assert events == []
 
 
 def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
