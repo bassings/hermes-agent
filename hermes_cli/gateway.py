@@ -731,6 +731,7 @@ def _read_systemd_unit_properties(
         "Result",
         "ExecMainStatus",
         "MainPID",
+        "RestartUSec",
     ),
 ) -> dict[str, str]:
     """Return selected ``systemctl show`` properties for the gateway unit."""
@@ -799,6 +800,22 @@ def _gateway_runtime_status_for_pid(pid: int | None) -> dict | None:
     return state if state_pid == pid else None
 
 
+def _systemd_usec_to_seconds(value: str | None, default: float = 1.0) -> float:
+    if not value:
+        return default
+    raw = str(value).strip().lower()
+    try:
+        if raw.endswith("ms"):
+            return max(0.1, float(raw[:-2]) / 1000.0)
+        if raw.endswith("us") or raw.endswith("µs"):
+            return max(0.1, float(raw[:-2]) / 1_000_000.0)
+        if raw.endswith("s"):
+            return max(0.1, float(raw[:-1]))
+        return max(0.1, float(raw) / 1_000_000.0)
+    except (TypeError, ValueError):
+        return default
+
+
 def _wait_for_systemd_service_restart(
     *,
     system: bool = False,
@@ -843,7 +860,7 @@ def _wait_for_systemd_service_restart(
                     printed_runtime_wait = True
 
         if active_state == "activating" and sub_state == "auto-restart":
-            time.sleep(1)
+            time.sleep(_systemd_usec_to_seconds(props.get("RestartUSec"), default=1.0))
             continue
 
         if _systemd_unit_is_start_limited(props):
@@ -2139,6 +2156,25 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     return candidates
 
 
+def _gateway_service_restart_sec() -> int:
+    """Return systemd RestartSec for planned gateway restarts.
+
+    Short by default for chat UX; configurable for operators.
+    """
+    raw = os.getenv("HERMES_GATEWAY_SERVICE_RESTART_SEC")
+    if raw is None:
+        try:
+            gateway_cfg = read_raw_config().get("gateway") or {}
+            raw = gateway_cfg.get("service_restart_sec")
+        except Exception:
+            raw = None
+    try:
+        value = int(raw) if raw is not None else 3
+    except (TypeError, ValueError):
+        value = 3
+    return max(1, min(value, 300))
+
+
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
     python_path = get_python_path()
     working_dir = str(PROJECT_ROOT)
@@ -2161,6 +2197,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
     # (#8202). 30s of headroom covers the worst case we've observed.
     _drain_timeout = int(_get_restart_drain_timeout() or 0)
     restart_timeout = max(60, _drain_timeout) + 30
+    restart_sec = _gateway_service_restart_sec()
 
     if system:
         username, group_name, home_dir = _system_service_identity(run_as_user)
@@ -2196,7 +2233,7 @@ Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=always
-RestartSec=5
+RestartSec={restart_sec}
 RestartMaxDelaySec=300
 RestartSteps=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -2231,7 +2268,7 @@ Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=always
-RestartSec=5
+RestartSec={restart_sec}
 RestartMaxDelaySec=300
 RestartSteps=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}

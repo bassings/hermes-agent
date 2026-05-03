@@ -2572,6 +2572,99 @@ class BasePlatformAdapter(ABC):
             return f"{existing_text}\n\n{new_text}".strip()
         return existing_text
 
+    def _inbound_journal(self):
+        """Return the durable inbound journal, or None if unavailable.
+
+        The journal is deliberately fail-open: forensic persistence must never
+        make a live chat message fail to process.
+        """
+        try:
+            from gateway.inbound_journal import InboundJournal
+
+            return InboundJournal.default()
+        except Exception as exc:
+            logger.debug("[%s] Inbound journal unavailable: %s", self.name, exc)
+            return None
+
+    def _record_inbound_journal_event(self, event: MessageEvent, session_key: str) -> Optional[str]:
+        try:
+            setattr(event, "_hermes_session_key", session_key)
+        except Exception:
+            pass
+        journal = self._inbound_journal()
+        if journal is None:
+            return None
+        try:
+            return journal.record_event(event, session_key=session_key, status="received")
+        except Exception as exc:
+            logger.debug("[%s] Failed to write inbound journal event: %s", self.name, exc)
+            return None
+
+    def _mark_inbound_journal(
+        self,
+        event: MessageEvent,
+        status: str,
+        *,
+        reason: Optional[str] = None,
+        **extra: Any,
+    ) -> None:
+        journal = self._inbound_journal()
+        if journal is None:
+            return
+        try:
+            journal.mark_event(event, status, reason=reason, **extra)
+        except Exception as exc:
+            logger.debug("[%s] Failed to mark inbound journal status=%s: %s", self.name, status, exc)
+
+    def _mark_response_send_attempt(self, event: MessageEvent, *, chat_id: str, content: str) -> None:
+        logger.info("[%s] Sending response (%d chars) to %s", self.name, len(content or ""), chat_id)
+        self._mark_inbound_journal(
+            event,
+            "response_attempted",
+            chat_id=chat_id,
+            response_len=len(content or ""),
+        )
+
+    def _record_response_send_result(self, event: MessageEvent, result: "SendResult", *, chat_id: str) -> None:
+        message_id = getattr(result, "message_id", None)
+        raw_response = getattr(result, "raw_response", None)
+        message_ids = None
+        if isinstance(raw_response, dict):
+            message_ids = raw_response.get("message_ids")
+        if message_ids is None and message_id:
+            message_ids = [message_id]
+        if getattr(result, "success", False):
+            try:
+                from gateway.inbound_journal import forensic_logging_enabled
+
+                log_success = forensic_logging_enabled()
+            except Exception:
+                log_success = False
+            if log_success:
+                logger.info(
+                    "[%s] Response send succeeded to %s message_id=%s message_ids=%s",
+                    self.name,
+                    chat_id,
+                    message_id,
+                    message_ids,
+                )
+            self._mark_inbound_journal(
+                event,
+                "response_sent",
+                chat_id=chat_id,
+                message_id=message_id,
+                message_ids=message_ids,
+            )
+            return
+        error = getattr(result, "error", None)
+        logger.warning("[%s] Response send failed to %s: %s", self.name, chat_id, error)
+        self._mark_inbound_journal(
+            event,
+            "response_failed",
+            chat_id=chat_id,
+            error=error,
+        )
+
     # ------------------------------------------------------------------
     # Session task + guard ownership helpers
     # ------------------------------------------------------------------
@@ -2773,6 +2866,7 @@ class BasePlatformAdapter(ABC):
         thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
 
         try:
+            self._mark_inbound_journal(event, "dispatch_started", reason=f"active_session_command:{cmd}")
             response = await self._message_handler(event)
             _text, _eph_ttl = self._unwrap_ephemeral(response)
             # Send the response BEFORE cancelling the old task so the send
@@ -2788,12 +2882,14 @@ class BasePlatformAdapter(ABC):
                     len(_text),
                     event.source.chat_id,
                 )
+                self._mark_response_send_attempt(event, chat_id=event.source.chat_id, content=_text)
                 _r = await self._send_with_retry(
                     chat_id=event.source.chat_id,
                     content=_text,
                     reply_to=_reply_anchor_for_event(event),
                     metadata=thread_meta,
                 )
+                self._record_response_send_result(event, _r, chat_id=event.source.chat_id)
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
                         chat_id=event.source.chat_id,
@@ -2837,6 +2933,11 @@ class BasePlatformAdapter(ABC):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+
+        # Durable pre-dispatch journal: record the inbound event before any
+        # adapter active-session queueing or runner dispatch can short-circuit
+        # it.  Fail-open so journal I/O cannot break live message handling.
+        self._record_inbound_journal_event(event, session_key)
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -2885,15 +2986,18 @@ class BasePlatformAdapter(ABC):
                 )
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    self._mark_inbound_journal(event, "dispatch_started", reason=f"active_session_bypass:{cmd}")
                     response = await self._message_handler(event)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
                     if _text:
+                        self._mark_response_send_attempt(event, chat_id=event.source.chat_id, content=_text)
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
                             content=_text,
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_thread_meta,
                         )
+                        self._record_response_send_result(event, _r, chat_id=event.source.chat_id)
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
                                 chat_id=event.source.chat_id,
@@ -2968,6 +3072,7 @@ class BasePlatformAdapter(ABC):
             # then process them immediately after the current task finishes.
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
+                self._mark_inbound_journal(event, "queued_active_session", reason="photo_followup")
                 merge_pending_message_event(self._pending_messages, session_key, event)
                 return  # Don't interrupt now - will run after current task completes
 
@@ -2984,6 +3089,7 @@ class BasePlatformAdapter(ABC):
             # ``merge_text=True`` flag extends that to plain TEXT events.
             # Same shape as the Telegram bursty-grace path in gateway/run.py.
             logger.debug("[%s] New message while session %s is active — triggering interrupt", self.name, session_key)
+            self._mark_inbound_journal(event, "queued_active_session", reason="active_session_interrupt")
             merge_pending_message_event(
                 self._pending_messages,
                 session_key,
@@ -3078,6 +3184,7 @@ class BasePlatformAdapter(ABC):
         
         try:
             await self._run_processing_hook("on_processing_start", event)
+            self._mark_inbound_journal(event, "dispatch_started")
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
@@ -3192,12 +3299,14 @@ class BasePlatformAdapter(ABC):
                         _thread_metadata["notify"] = True
                     else:
                         _thread_metadata = {"notify": True}
+                    self._mark_response_send_attempt(event, chat_id=event.source.chat_id, content=text_content)
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=_reply_anchor,
                         metadata=_thread_metadata,
                     )
+                    self._record_response_send_result(event, result, chat_id=event.source.chat_id)
                     _record_delivery(result)
 
                     # Schedule auto-deletion of system-notice replies.

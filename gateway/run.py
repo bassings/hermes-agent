@@ -3782,6 +3782,12 @@ class GatewayRunner:
                 skip_targets=skip_home_targets,
             )
 
+        # Replay inbound events that were durably queued before a planned
+        # restart/disconnect (for example stale-code hot-path detection).
+        # Do this before auto-resume so a queued real user message can own the
+        # next turn instead of stale interrupted work.
+        await self._drain_inbound_replay_queue()
+
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
         # by the normal successful-turn path, so a failed auto-resume remains
@@ -5883,6 +5889,53 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+
+        # Stale-code self-check (Issue #17648).  A gateway that survives
+        # ``hermes update`` keeps old modules cached in sys.modules; the
+        # first inbound message is our earliest safe chance to detect
+        # this and restart gracefully before we dispatch to the agent
+        # and hit ImportError on freshly-added names (e.g. cfg_get).
+        # Idempotent — runs the real check at most once per message, and
+        # request_restart() no-ops after the first call.
+        try:
+            if self._detect_stale_code():
+                try:
+                    from gateway.inbound_journal import InboundJournal
+
+                    journal = InboundJournal(home=_hermes_home)
+                    journal_id = journal.record_event(event, status="received", reason="stale_code_restart")
+                    replay_path = journal.enqueue_replay(
+                        event,
+                        reason="stale_code_restart",
+                        journal_id=journal_id,
+                    )
+                    logger.info(
+                        "Stale-code restart triggered by user message; event queued for replay: platform=%s chat=%s update_id=%s journal_id=%s replay_path=%s",
+                        source.platform.value if source.platform else "unknown",
+                        source.chat_id,
+                        getattr(event, "platform_update_id", None),
+                        journal_id,
+                        replay_path,
+                    )
+                except Exception as replay_exc:
+                    logger.error(
+                        "Stale-code restart could not queue triggering message for replay: %s",
+                        replay_exc,
+                        exc_info=True,
+                    )
+                self._trigger_stale_code_restart()
+                # Acknowledge to the user so they don't see a silent
+                # drop; the gateway will be back up in a moment via the
+                # service manager / profile-watcher respawn.  The triggering
+                # message has been durably queued for replay when possible.
+                return (
+                    "⟳ Gateway code was updated in the background — "
+                    "restarting this gateway so your message can continue "
+                    "on the new code. Please retry in a moment if you do not "
+                    "see it resume automatically."
+                )
+        except Exception as _stale_exc:
+            logger.debug("Stale-code self-check failed: %s", _stale_exc)
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -13294,6 +13347,53 @@ class GatewayRunner:
 
         return True
 
+    async def _drain_inbound_replay_queue(self) -> None:
+        """Replay inbound events persisted before a gateway restart.
+
+        Used for stale-code restarts and shutdown-time Telegram text batches.
+        The queue is file-backed and deduped by platform/chat/user/message/update/text
+        fingerprint so duplicate queue records cannot create duplicate agent turns.
+        """
+        try:
+            from gateway.inbound_journal import InboundJournal, ReplayQueue
+
+            queue = ReplayQueue(home=_hermes_home)
+            journal = InboundJournal(home=_hermes_home)
+        except Exception as exc:
+            logger.debug("Inbound replay queue unavailable: %s", exc)
+            return
+
+        for path, payload in list(queue.iter_items()):
+            fingerprint = str(payload.get("fingerprint") or "")
+            if fingerprint and queue.has_seen(fingerprint):
+                queue.delete(path)
+                continue
+            try:
+                event = queue.event_from_item(payload)
+                platform = event.source.platform
+                adapter = self.adapters.get(platform)
+                if not adapter:
+                    logger.warning(
+                        "Inbound replay skipped; adapter not connected: platform=%s path=%s",
+                        getattr(platform, "value", platform),
+                        path,
+                    )
+                    continue
+                await adapter.handle_message(event)
+                if fingerprint:
+                    queue.mark_seen(fingerprint)
+                journal.mark_event(event, "replayed", reason=payload.get("reason"), replay_path=str(path))
+                queue.delete(path)
+                logger.info(
+                    "Inbound replay delivered: platform=%s chat=%s update_id=%s journal_id=%s",
+                    event.source.platform.value if event.source.platform else "unknown",
+                    event.source.chat_id,
+                    getattr(event, "platform_update_id", None),
+                    getattr(event, "_hermes_journal_id", None),
+                )
+            except Exception as exc:
+                logger.warning("Inbound replay failed for %s: %s", path, exc, exc_info=True)
+
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""
         notify_path = _hermes_home / ".restart_notify.json"
@@ -13310,6 +13410,15 @@ class GatewayRunner:
                 return None
 
             platform = Platform(platform_str)
+            if platform == Platform.TELEGRAM:
+                try:
+                    int(str(chat_id))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Invalid restart notification target for Telegram: chat_id=%r",
+                        chat_id,
+                    )
+                    return
             adapter = self.adapters.get(platform)
             if not adapter:
                 logger.debug(
@@ -13338,7 +13447,7 @@ class GatewayRunner:
             # the log line is misleading and hides real delivery failures.
             if result is not None and getattr(result, "success", True) is False:
                 logger.warning(
-                    "Restart notification to %s:%s was not delivered: %s",
+                    "Restart notification send failed for %s:%s: %s",
                     platform_str,
                     chat_id,
                     getattr(result, "error", "send returned success=False"),

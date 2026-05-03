@@ -1443,7 +1443,25 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
 
     async def disconnect(self) -> None:
-        """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        """Stop polling/webhook, persist pending text batches, cancel album flushes, and disconnect."""
+        pending_text_tasks = list(self._pending_text_batch_tasks.values())
+        for task in pending_text_tasks:
+            if task and not task.done():
+                task.cancel()
+        if pending_text_tasks:
+            await asyncio.gather(*pending_text_tasks, return_exceptions=True)
+        if self._pending_text_batches:
+            try:
+                from gateway.inbound_journal import InboundJournal
+
+                journal = InboundJournal.default()
+                for event in list(self._pending_text_batches.values()):
+                    journal.enqueue_replay(event, reason="telegram_disconnect_pending_text")
+            except Exception as exc:
+                logger.warning("[%s] Failed to persist pending Telegram text batch(es): %s", self.name, exc, exc_info=True)
+        self._pending_text_batch_tasks.clear()
+        self._pending_text_batches.clear()
+
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -1509,6 +1527,12 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+
+        try:
+            numeric_chat_id = int(str(chat_id))
+        except (TypeError, ValueError):
+            logger.warning("[%s] invalid Telegram chat_id: %r", self.name, chat_id)
+            return SendResult(success=False, error="invalid-chat-id")
         
         try:
             # Format and split message if needed
@@ -1568,7 +1592,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         # Try Markdown first, fall back to plain text if it fails
                         try:
                             msg = await self._bot.send_message(
-                                chat_id=int(chat_id),
+                                chat_id=numeric_chat_id,
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
@@ -1582,7 +1606,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
                                 plain_chunk = _strip_mdv2(chunk)
                                 msg = await self._bot.send_message(
-                                    chat_id=int(chat_id),
+                                    chat_id=numeric_chat_id,
                                     text=plain_chunk,
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
