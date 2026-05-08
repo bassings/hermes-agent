@@ -35,11 +35,12 @@ def test_gateway_restart_wait_logic_reads_restart_usec(monkeypatch):
     monkeypatch.setattr(gateway_cli, "get_service_name", lambda: "hermes-gateway.service")
     monkeypatch.setattr(gateway_cli, "_service_scope_label", lambda _system: "user")
     monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: system)
+    monkeypatch.setattr(gateway_cli, "_gateway_runtime_status_for_pid", lambda pid: {"gateway_state": "running"})
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)
 
     import time
 
-    monkeypatch.setattr(time, "time", lambda: now["value"])
+    monkeypatch.setattr(time, "monotonic", lambda: now["value"])
 
     def fake_sleep(seconds):
         sleeps.append(seconds)
