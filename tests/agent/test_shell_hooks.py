@@ -738,3 +738,84 @@ class TestAllowlistConcurrency:
 
         assert len(tmp_paths_seen) == 2
         assert tmp_paths_seen[0] != tmp_paths_seen[1]
+
+
+# ── GCB WordPress shell-hook guard ─────────────────────────────────────────
+
+GCB_GUARD_HOOK = Path("/home/scott/.hermes/agent-hooks/gcb-wp-guard.py")
+
+
+def _load_gcb_guard_hook():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("gcb_wp_guard_hook_under_test", GCB_GUARD_HOOK)
+    assert spec and spec.loader, f"cannot import {GCB_GUARD_HOOK}"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _gcb_payload(tool_name: str, tool_input: dict) -> dict:
+    return {
+        "hook_event_name": "pre_tool_call",
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "session_id": "test-session",
+        "cwd": "/home/scott/.hermes/hermes-agent",
+        "extra": {},
+    }
+
+
+@pytest.mark.skipif(
+    os.environ.get("HERMES_LOCAL_SKILL_TESTS") != "1" or not GCB_GUARD_HOOK.exists(),
+    reason="local GCB hook tests require HERMES_LOCAL_SKILL_TESTS=1 and Scott's local hook",
+)
+class TestGcbWordPressGuardHook:
+    def test_blocks_terminal_wp_eval_file(self):
+        hook = _load_gcb_guard_hook()
+        result = hook.evaluate_payload(_gcb_payload("terminal", {"command": "wp eval-file /tmp/gcb_jobs/qashqai/finish_swap.php"}))
+
+        assert result["action"] == "block"
+        assert "GCB guard blocked unsafe WordPress path" in result["message"]
+
+    def test_blocks_terminal_wp_db_query(self):
+        hook = _load_gcb_guard_hook()
+        result = hook.evaluate_payload(_gcb_payload("terminal", {"command": "wp db query 'UPDATE wp_posts SET post_content=\"x\" WHERE ID=113103'"}))
+
+        assert result["action"] == "block"
+        assert "GCB guard blocked unsafe WordPress path" in result["message"]
+
+    def test_blocks_execute_code_containing_wp_db_query(self):
+        hook = _load_gcb_guard_hook()
+        result = hook.evaluate_payload(
+            _gcb_payload(
+                "execute_code",
+                {"code": "from hermes_tools import terminal\nterminal(\"wp db query 'UPDATE wp_posts SET post_content=\\\"x\\\" WHERE ID=113103'\")"},
+            )
+        )
+
+        assert result["action"] == "block"
+        assert "GCB guard blocked unsafe WordPress path" in result["message"]
+
+    def test_blocks_media_import_after_copied_draft_context(self):
+        hook = _load_gcb_guard_hook()
+        command = (
+            "echo PREVIOUS_POST_COPIED_VISIBLE draft_id=113103 && "
+            "wp media import /tmp/gcb_jobs/qashqai/new-image.jpg --post_id=113103"
+        )
+        result = hook.evaluate_payload(_gcb_payload("terminal", {"command": command}))
+
+        assert result["action"] == "block"
+        assert "GCB guard blocked unsafe WordPress path" in result["message"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "wp post update 113103 --post_title='Safe swap' --post_content='<p>Safe</p>'",
+            "wp post term set 113103 category 123 --by=id",
+        ],
+    )
+    def test_allows_safe_post_update_and_term_set_by_id(self, command):
+        hook = _load_gcb_guard_hook()
+
+        assert hook.evaluate_payload(_gcb_payload("terminal", {"command": command})) == {"action": "allow"}
